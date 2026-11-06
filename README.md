@@ -4,18 +4,13 @@ A [Claude Code](https://claude.com/claude-code) skill that makes short animated 
 
 Give it reference images or videos and a rough idea. It studies the style, plans the shots, draws every frame, writes the music, checks its own work and hands you an MP4. No AI video model, no animator.
 
-<table>
-  <tr>
-    <th>Your still image</th>
-    <th>Animated by this skill</th>
-  </tr>
-  <tr>
-    <td><img src="docs/train-still.jpg" width="320" alt="A still illustration of an orange train under a cherry blossom tree"></td>
-    <td><img src="docs/train.gif" width="320" alt="The same image animated: the train approaches, petals fall, branches and grass sway"></td>
-  </tr>
-</table>
+<p align="center">
+  <img src="docs/train.gif" width="360" alt="An illustration animated by this skill: the train approaches, petals fall, branches and grass sway">
+</p>
 
-[Watch the full-quality video](examples/moving-image/train-animated.mp4)
+<p align="center">
+  Animated from <a href="docs/train-still.jpg">this still image</a>. <a href="examples/moving-image/train-animated.mp4">Watch it in full quality</a>.
+</p>
 
 More frames from films made with this skill:
 
