@@ -1,0 +1,43 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>piece</title>
+<style>
+  /* Copy any font you use next to this file: @font-face { font-family: "Plex"; src: url("fonts/IBMPlexMono-SemiBold.ttf"); } */
+  html, body { margin: 0; background: #000; }
+  canvas { display: block; }
+</style>
+<canvas id="c"></canvas>
+<script>
+const W = 1080, H = 1920, FPS = 30, DURATION = 15;
+window.PIECE = { width: W, height: H, fps: FPS, duration: DURATION };
+
+const canvas = document.getElementById("c");
+canvas.width = W;
+canvas.height = H;
+const ctx = canvas.getContext("2d");
+
+// Seeded, so every render process paints exactly the same picture.
+const rng = (seed) => () => {
+  seed = (seed + 0x6d2b79f5) | 0;
+  let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+  t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+  return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+};
+const clamp = (x, a = 0, b = 1) => Math.min(b, Math.max(a, x));
+const progress = (t, start, end) => clamp((t - start) / (end - start));
+const easeOut = (x) => 1 - (1 - x) ** 3;
+const easeInOut = (x) => (x < 0.5 ? 4 * x ** 3 : 1 - (-2 * x + 2) ** 3 / 2);
+const layer = (w = W, h = H) => Object.assign(document.createElement("canvas"), { width: w, height: h });
+
+// Paint anything expensive here, once. Canvas text doesn't trigger font loading, so load each font by name:
+// await document.fonts.load('600 54px "Plex"');
+window.ready = (async () => {
+  await document.fonts.ready;
+})();
+
+// Must depend only on t: frames are rendered out of order.
+window.renderFrame = (t) => {
+  ctx.fillStyle = "#f3e9d8";
+  ctx.fillRect(0, 0, W, H);
+};
+</script>

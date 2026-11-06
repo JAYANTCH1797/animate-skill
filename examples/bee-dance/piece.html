@@ -1,0 +1,1347 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>bee-dance</title>
+<style>
+  @font-face { font-family: "Plex"; src: url("../../assets/fonts/IBMPlexMono-SemiBold.ttf"); font-weight: 600; }
+  html, body { margin: 0; background: #000; }
+  canvas { display: block; }
+</style>
+<canvas id="c"></canvas>
+<script>
+const W = 1080, H = 1920, FPS = 30, DURATION = 15;
+window.PIECE = { width: W, height: H, fps: FPS, duration: DURATION };
+
+const canvas = document.getElementById("c");
+canvas.width = W;
+canvas.height = H;
+const ctx = canvas.getContext("2d");
+
+// ---------- helpers ----------
+const rng = (seed) => () => {
+  seed = (seed + 0x6d2b79f5) | 0;
+  let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+  t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+  return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+};
+const clamp = (x, a = 0, b = 1) => Math.min(b, Math.max(a, x));
+const progress = (t, start, end) => clamp((t - start) / (end - start));
+const easeOut = (x) => 1 - (1 - x) ** 3;
+const easeIn = (x) => x ** 3;
+const easeInOut = (x) => (x < 0.5 ? 4 * x ** 3 : 1 - (-2 * x + 2) ** 3 / 2);
+const backOut = (x) => 1 + 2.4 * (x - 1) ** 3 + 1.4 * (x - 1) ** 2;
+const smooth = (a, b, x) => { const u = clamp((x - a) / (b - a)); return u * u * (3 - 2 * u); };
+const mix = (a, b, u) => a + (b - a) * u;
+const layer = (w = W, h = H) => Object.assign(document.createElement("canvas"), { width: w, height: h });
+const rgb = (hex) => [1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16));
+const mix3 = (a, b, u) => [mix(a[0], b[0], u), mix(a[1], b[1], u), mix(a[2], b[2], u)];
+
+// Value noise from a seeded lattice; the same seed always paints the same picture.
+function makeNoise(seed) {
+  const r = rng(seed), table = new Float32Array(65536);
+  for (let i = 0; i < 65536; i++) table[i] = r();
+  const n = (x, y) => {
+    const xi = Math.floor(x), yi = Math.floor(y), fx = x - xi, fy = y - yi;
+    const u = fx * fx * (3 - 2 * fx), v = fy * fy * (3 - 2 * fy);
+    const a = ((yi & 255) << 8), b = (((yi + 1) & 255) << 8), c = xi & 255, d = (xi + 1) & 255;
+    const top = table[a | c] + (table[a | d] - table[a | c]) * u;
+    const bot = table[b | c] + (table[b | d] - table[b | c]) * u;
+    return top + (bot - top) * v;
+  };
+  const fbm = (x, y, oct = 4) => {
+    let sum = 0, amp = 0.5, norm = 0;
+    for (let i = 0; i < oct; i++) { sum += amp * n(x, y); norm += amp; amp *= 0.5; x = x * 2.03 + 17.1; y = y * 2.03 + 9.2; }
+    return sum / norm;
+  };
+  return { n, fbm };
+}
+
+// ---------- the geometry of the dance: everything hangs off these ----------
+const THETA = (30 * Math.PI) / 180;
+const O = { x: 440, y: 1240 };                               // where every waggle run starts; later, the hive door
+const U = { x: Math.sin(THETA), y: -Math.cos(THETA) };       // the direction of the run
+const N = { x: Math.cos(THETA), y: Math.sin(THETA) };        // right of the run
+const RUN = 400, FAR = 880;
+const at = (d, s = 0) => ({ x: O.x + U.x * d + N.x * s, y: O.y + U.y * d + N.y * s });
+const P = at(RUN), E = at(FAR);
+const SUN = { x: O.x, y: 318, r: 92 };
+const CAPTION_Y = 1496;
+
+function cubic(a, b, c, d, n = 160) {
+  const out = [];
+  for (let i = 0; i <= n; i++) {
+    const u = i / n, v = 1 - u;
+    out.push({ x: v ** 3 * a.x + 3 * v * v * u * b.x + 3 * v * u * u * c.x + u ** 3 * d.x, y: v ** 3 * a.y + 3 * v * v * u * b.y + 3 * v * u * u * c.y + u ** 3 * d.y });
+  }
+  return out;
+}
+function spline(points, per = 40) {
+  const out = [], q = [points[0], ...points, points[points.length - 1]];
+  for (let i = 1; i < q.length - 2; i++) {
+    for (let j = 0; j < per; j++) {
+      const u = j / per, a = q[i - 1], b = q[i], c = q[i + 1], d = q[i + 2];
+      const f = (p0, p1, p2, p3) => 0.5 * (2 * p1 + (p2 - p0) * u + (2 * p0 - 5 * p1 + 4 * p2 - p3) * u * u + (3 * p1 - p0 - 3 * p2 + p3) * u ** 3);
+      out.push({ x: f(a.x, b.x, c.x, d.x), y: f(a.y, b.y, c.y, d.y) });
+    }
+  }
+  out.push(points[points.length - 1]);
+  return out;
+}
+// Resample to even spacing so "fraction of the path" means "fraction of the distance".
+function even(points, n = 240) {
+  const lengths = [0];
+  for (let i = 1; i < points.length; i++) lengths.push(lengths[i - 1] + Math.hypot(points[i].x - points[i - 1].x, points[i].y - points[i - 1].y));
+  const total = lengths[lengths.length - 1], out = [];
+  let k = 0;
+  for (let i = 0; i <= n; i++) {
+    const want = (total * i) / n;
+    while (k < lengths.length - 2 && lengths[k + 1] < want) k++;
+    const u = (want - lengths[k]) / Math.max(1e-6, lengths[k + 1] - lengths[k]);
+    out.push({ x: mix(points[k].x, points[k + 1].x, u), y: mix(points[k].y, points[k + 1].y, u) });
+  }
+  return out;
+}
+const lobe = (side) => even(cubic(P, at(RUN + 210, side * 250), at(-210, side * 250), O));
+const run = even([O, P]);
+const entry = even(spline([
+  { x: -90, y: 900 }, { x: 70, y: 1010 }, { x: 230, y: 950 }, { x: 318, y: 1060 }, { x: 214, y: 1158 },
+  { x: 128, y: 1076 }, { x: 214, y: 1006 }, { x: 330, y: 1120 }, { x: 345, y: 1330 }, at(-52, -8), O,
+]));
+
+// Her whole route, as timed segments. A waggle run lasts 1 s because 1 s means about 1 km.
+const ROUTE = [
+  { pts: entry, t0: 1.25, t1: 2.75, ease: (u) => easeOut(u) * 0.35 + u * 0.65 },
+  { pts: run, t0: 2.75, t1: 3.75, waggle: true },
+  { pts: lobe(1), t0: 3.75, t1: 4.55, ease: (u) => u },
+  { pts: run, t0: 4.55, t1: 5.55, waggle: true },
+  { pts: lobe(-1), t0: 5.55, t1: 6.35, ease: (u) => u },
+  { pts: run, t0: 6.35, t1: 7.35, waggle: true },
+  { pts: lobe(1), t0: 7.35, t1: 8.15, ease: (u) => u },
+  { pts: run, t0: 8.15, t1: 9.15, waggle: true },
+  { pts: lobe(-1), t0: 9.15, t1: 10.1, ease: (u) => easeInOut(u) * 0.5 + u * 0.5 },
+];
+const sample = (pts, u) => {
+  const f = clamp(u) * (pts.length - 1), i = Math.min(pts.length - 2, Math.floor(f)), k = f - i;
+  return { x: mix(pts[i].x, pts[i + 1].x, k), y: mix(pts[i].y, pts[i + 1].y, k) };
+};
+const fractionOf = (seg, t) => { const u = progress(t, seg.t0, seg.t1); return seg.ease ? seg.ease(u) : u; };
+function dancerAt(t) {
+  if (t <= ROUTE[0].t0) return { ...ROUTE[0].pts[0], seg: null };
+  for (const seg of ROUTE) if (t < seg.t1) return { ...sample(seg.pts, fractionOf(seg, t)), seg };
+  return { ...O, seg: null };
+}
+const angleBetween = (a, b) => Math.atan2(b.y - a.y, b.x - a.x);
+const turn = (a, b) => Math.atan2(Math.sin(b - a), Math.cos(b - a));
+function dancerHeading(t) {
+  if (t >= 10.1) return Math.atan2(U.y, U.x);
+  const a = dancerAt(t - 0.1), b = dancerAt(t + 0.1);
+  if (Math.hypot(b.x - a.x, b.y - a.y) < 0.2) return Math.atan2(U.y, U.x);
+  return angleBetween(a, b);
+}
+
+// ---------- static layers, painted once ----------
+let paperC, grainC, washC, combC, sunC, glowC, skyC, cloudC, landC, treeC, hiveC, bee;
+let D1, F1, WASH, D2, F2, bloomC, bloomImg, revealC, revealImg, rimC, rimImg;
+
+function paintPaper() {
+  const nz = makeNoise(11), c = layer(), g = c.getContext("2d"), img = g.createImageData(W, H), d = img.data;
+  const base = rgb("#f0e5d0"), edge = rgb("#dcc9a8"), warm = rgb("#eadbc0");
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const mott = nz.fbm(x / 340, y / 240, 4), fibre = nz.fbm(x / 700, y / 16, 3), fine = nz.n(x / 2.3, y / 2.3);
+      const dist = Math.hypot((x - 540) / 640, (y - 960) / 1120);
+      const c0 = mix3(mix3(base, warm, smooth(0.34, 0.7, mott) * 0.7), edge, smooth(0.62, 1.2, dist) * 0.85);
+      const v = 1 + (fibre - 0.5) * 0.018 + (fine - 0.5) * 0.02;
+      const i = (y * W + x) * 4;
+      d[i] = c0[0] * v; d[i + 1] = c0[1] * v; d[i + 2] = c0[2] * v; d[i + 3] = 255;
+    }
+  }
+  g.putImageData(img, 0, 0);
+  paperC = c;
+
+  // One fixed grain over everything, so painted things sit in the paper rather than on it.
+  const k = layer(), kg = k.getContext("2d"), ki = kg.createImageData(W, H), kd = ki.data, nz2 = makeNoise(12);
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const v = 251 + (nz2.n(x / 1.7, y / 1.7) - 0.5) * 11 + (nz2.fbm(x / 9, y / 6, 2) - 0.5) * 7;
+      const i = (y * W + x) * 4;
+      kd[i] = kd[i + 1] = kd[i + 2] = v; kd[i + 3] = 255;
+    }
+  }
+  kg.putImageData(ki, 0, 0);
+  grainC = k;
+}
+
+// A hex cell's outline with a little hand wobble.
+function hexPath(g, cx, cy, r, wob, rand) {
+  g.beginPath();
+  for (let i = 0; i < 6; i++) {
+    const a = Math.PI / 6 + (i * Math.PI) / 3;
+    const x = cx + Math.cos(a) * r + (rand() - 0.5) * wob, y = cy + Math.sin(a) * r + (rand() - 0.5) * wob;
+    if (i) g.lineTo(x, y); else g.moveTo(x, y);
+  }
+  g.closePath();
+}
+
+function paintWash() {
+  const nz = makeNoise(21), c = layer(), g = c.getContext("2d"), img = g.createImageData(W, H), d = img.data;
+  const mid = rgb("#f0728b"), light = rgb("#fa93a4"), deep = rgb("#e0607b");
+  F1 = new Float32Array(W * H);
+  D1 = new Float32Array(W * H);
+  const cx = 540, cy = 950, ax = 506, ay = 868;
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const i = y * W + x;
+      // The final shape: part oval, part giant comb cell, with a wandering watercolour edge.
+      const qx = (x - cx) / ax, qy = (y - cy) / ay, ux = Math.abs(qx), uy = Math.abs(qy);
+      const hex = Math.max(ux, ux * 0.5 + uy * 0.866) * 1.02, oval = Math.hypot(qx, qy);
+      const shape = mix(oval, hex, 0.14) + (nz.fbm(x / 210 + 5, y / 210, 3) - 0.5) * 0.085 + (nz.fbm(x / 34, y / 34, 2) - 0.5) * 0.014;
+      F1[i] = (1 - shape) * 500;
+      // Time-to-arrive for the bloom, spreading from the drop.
+      const dist = Math.hypot(x - O.x, y - O.y), ang = Math.atan2(y - O.y, x - O.x);
+      D1[i] = dist * (1 + (nz.fbm(Math.cos(ang) * 1.7 + 9, Math.sin(ang) * 1.7 + 3, 3) - 0.5) * 0.55) + (nz.fbm(x / 70, y / 70, 2) - 0.5) * Math.min(30, 6 + dist * 0.06);
+      // Colour: big soft blooms of lighter and deeper pigment, then fine granulation.
+      const a = nz.fbm(x / 270 + 40, y / 200, 4), b = nz.fbm(x / 170, y / 190 + 30, 3), band = nz.fbm(x / 900, y / 240 + 70, 2);
+      let col = mix3(mid, deep, smooth(0.46, 0.68, a) * 0.8 + smooth(0.5, 0.7, band) * 0.25);
+      col = mix3(col, light, smooth(0.5, 0.68, b) * 0.85);
+      const gran = 1 + (nz.n(x / 2.6, y / 2.6) - 0.5) * 0.05 + (nz.fbm(x / 7, y / 7, 2) - 0.5) * 0.06;
+      const j = i * 4;
+      d[j] = col[0] * gran; d[j + 1] = col[1] * gran; d[j + 2] = col[2] * gran; d[j + 3] = 255;
+    }
+  }
+  g.putImageData(img, 0, 0);
+
+  // Wax resist: cell interiors take more pigment, the walls stay pale.
+  const r = rng(22), cell = 56, dx = cell * Math.sqrt(3), dy = cell * 1.5;
+  const honey = rgb("#f6b93f"), amber = rgb("#ee8f2c"), cream = rgb("#ffe6c4");
+  const cz = layer(), cg = cz.getContext("2d");
+  let row = 0;
+  for (let y = -cell; y < H + cell; y += dy, row++) {
+    for (let x = -cell + (row % 2) * (dx / 2); x < W + cell; x += dx) {
+      const hx = x, hy = y;
+      g.save();
+      hexPath(g, hx, hy, cell * 0.84, 3.5, r);
+      g.globalCompositeOperation = "multiply";
+      const shade = 0.55 + r() * 0.45;
+      const grad = g.createRadialGradient(hx - 8, hy - 10, 4, hx, hy, cell);
+      grad.addColorStop(0, `rgba(250,200,205,${0.16 * shade})`);
+      grad.addColorStop(1, `rgba(226,120,146,${0.42 * shade})`);
+      g.fillStyle = grad;
+      g.fill();
+      g.restore();
+
+      // Clusters of stored honey and pollen, kept away from the dance floor.
+      const nearDance = Math.hypot(hx - 540, (hy - 1060) * 0.82) < 400;
+      const store = nz.fbm(hx / 240 + 3, hy / 240 + 8, 3);
+      const keepClear = Math.abs(hy - CAPTION_Y) < 90;
+      if (!nearDance && !keepClear && store > 0.555) {
+        const pollen = r() < 0.22;
+        const top = pollen ? amber : honey, low = pollen ? rgb("#df6a2c") : amber;
+        cg.save();
+        cg.filter = "blur(1.1px)";
+        hexPath(cg, hx + (r() - 0.5) * 5, hy + (r() - 0.5) * 5, cell * 0.74, 9, r);
+        const fill = cg.createRadialGradient(hx - 14, hy - 16, 2, hx, hy, cell);
+        fill.addColorStop(0, `rgba(${cream},0.9)`);
+        fill.addColorStop(0.35, `rgba(${top.map(Math.round)},0.85)`);
+        fill.addColorStop(1, `rgba(${low.map(Math.round)},0.8)`);
+        cg.fillStyle = fill;
+        cg.fill();
+        cg.lineWidth = 4;
+        cg.strokeStyle = `rgba(214,100,40,0.35)`;
+        cg.stroke();
+        cg.restore();
+      }
+      // White pen on some walls only; drawing every wall looks like a grid.
+      if (nz.fbm(hx / 300 + 20, hy / 300, 2) > 0.44) {
+        cg.lineWidth = 2.4;
+        cg.lineJoin = "round";
+        const a0 = Math.floor(r() * 6), sides = 2 + Math.floor(r() * 3);
+        cg.beginPath();
+        for (let i = 0; i <= sides; i++) {
+          const a = Math.PI / 6 + ((a0 + i) * Math.PI) / 3;
+          const px = hx + Math.cos(a) * cell * 0.98 + (r() - 0.5) * 3, py = hy + Math.sin(a) * cell * 0.98 + (r() - 0.5) * 3;
+          if (i) cg.lineTo(px, py); else cg.moveTo(px, py);
+        }
+        cg.strokeStyle = `rgba(255,246,238,${0.45 + r() * 0.3})`;
+        cg.stroke();
+      }
+    }
+  }
+  WASH = g.getImageData(0, 0, W, H).data;
+  // Keep the comb inside the wash shape.
+  const mask = layer(), mg = mask.getContext("2d"), mi = mg.createImageData(W, H);
+  for (let i = 0; i < W * H; i++) mi.data[i * 4 + 3] = smooth(10, 34, F1[i]) * 255;
+  mg.putImageData(mi, 0, 0);
+  cg.globalCompositeOperation = "destination-in";
+  cg.drawImage(mask, 0, 0);
+  cg.globalCompositeOperation = "source-over";
+  // Pigment never lies evenly: thin the gold and the pen in patches.
+  const ci = cg.getImageData(0, 0, W, H), cd = ci.data;
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const j = (y * W + x) * 4 + 3;
+      if (cd[j]) cd[j] *= clamp(0.62 + nz.fbm(x / 26 + 50, y / 26, 3) * 0.55 + (nz.n(x / 2.4, y / 2.4) - 0.5) * 0.14);
+    }
+  }
+  cg.putImageData(ci, 0, 0);
+  combC = cz;
+
+  bloomC = layer();
+  bloomImg = bloomC.getContext("2d").createImageData(W, H);
+  washC = layer();
+  paintBloom(99999);
+  washC.getContext("2d").drawImage(bloomC, 0, 0);
+}
+
+// The wash at bloom radius R, with pigment pooled in a dark band at the moving edge.
+function paintBloom(R) {
+  const d = bloomImg.data;
+  d.fill(0);
+  const x0 = Math.max(0, Math.floor(O.x - R * 1.5)), x1 = Math.min(W, Math.ceil(O.x + R * 1.5));
+  const y0 = Math.max(0, Math.floor(O.y - R * 1.5)), y1 = Math.min(H, Math.ceil(O.y + R * 1.5));
+  for (let y = y0; y < y1; y++) {
+    for (let x = x0; x < x1; x++) {
+      const i = y * W + x, inner = Math.min(R - D1[i], F1[i]);
+      if (inner <= 0) continue;
+      const j = i * 4, a = inner > 2.4 ? 1 : inner / 2.4, pool = 1 - 0.2 * Math.exp(-inner / 11) + 0.05 * Math.exp(-((inner - 34) ** 2) / 500);
+      d[j] = WASH[j] * pool; d[j + 1] = WASH[j + 1] * pool * pool; d[j + 2] = WASH[j + 2] * pool * pool; d[j + 3] = a * 255;
+    }
+  }
+  bloomC.getContext("2d").putImageData(bloomImg, 0, 0);
+}
+
+function paintSun() {
+  const size = 420, c = layer(size, size), g = c.getContext("2d"), img = g.createImageData(size, size), d = img.data, nz = makeNoise(31);
+  const core = rgb("#ffe08a"), body = rgb("#f9c54d"), rim = rgb("#ef9d2c");
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      const dx = x - size / 2, dy = y - size / 2, r = Math.hypot(dx, dy), edge = SUN.r + (nz.fbm(x / 34, y / 34, 3) - 0.5) * 12, inner = edge - r;
+      if (inner <= 0) continue;
+      let col = mix3(core, body, smooth(0.1, 0.85, r / edge + (nz.fbm(x / 70 + 9, y / 70, 3) - 0.5) * 0.35));
+      col = mix3(col, rim, Math.exp(-inner / 8) * 0.8);
+      const gran = 1 + (nz.n(x / 2.6, y / 2.6) - 0.5) * 0.05;
+      const j = (y * size + x) * 4;
+      d[j] = col[0] * gran; d[j + 1] = col[1] * gran; d[j + 2] = col[2] * gran; d[j + 3] = clamp(inner / 2.4) * 255;
+    }
+  }
+  g.putImageData(img, 0, 0);
+  sunC = c;
+
+  // Warm light bleeding down through the pink.
+  const k = layer(), kg = k.getContext("2d");
+  const grad = kg.createRadialGradient(SUN.x, SUN.y, 40, SUN.x, SUN.y, 980);
+  grad.addColorStop(0, "rgba(255,224,130,0.95)");
+  grad.addColorStop(0.28, "rgba(255,200,120,0.6)");
+  grad.addColorStop(0.65, "rgba(255,170,120,0.2)");
+  grad.addColorStop(1, "rgba(255,160,120,0)");
+  kg.fillStyle = grad;
+  kg.fillRect(0, 0, W, H);
+  kg.globalCompositeOperation = "destination-in";
+  kg.drawImage(washC, 0, 0);
+  glowC = k;
+}
+
+function paintMeadow() {
+  const nz = makeNoise(41), r = rng(42);
+  const skyTop = rgb("#58a6ee"), skyMid = rgb("#97cff2"), skyLow = rgb("#e6efdc");
+  const hillA = rgb("#9cc9c6"), hillB = rgb("#93c28e"), hillB2 = rgb("#b6d68e");
+  const far = rgb("#e4e596"), lit = rgb("#bdd678"), near = rgb("#84b860");
+  const horizon = (x) => 690 + (nz.fbm(x / 420 + 3, 1.3, 3) - 0.5) * 60;
+  const ridgeA = (x) => 640 - 170 * smooth(0, 1, nz.fbm(x / 520 + 9, 4.1, 3)) + 40;
+  const ridgeB = (x) => 668 - 90 * smooth(0.1, 0.9, nz.fbm(x / 340 + 1, 7.7, 3)) + 24;
+
+  const c = layer(), g = c.getContext("2d"), img = g.createImageData(W, H), d = img.data;
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const hz = horizon(x), rA = ridgeA(x), rB = ridgeB(x);
+      const n1 = nz.fbm(x / 250, y / 170, 4), n2 = nz.fbm(x / 120 + 30, y / 80, 3);
+      let col;
+      if (y < rA) {
+        const u = y / 660;
+        col = u < 0.55 ? mix3(skyTop, skyMid, u / 0.55) : mix3(skyMid, skyLow, (u - 0.55) / 0.45);
+        col = mix3(col, skyLow, smooth(0.5, 0.72, n1) * 0.35);
+      } else if (y < rB) {
+        col = mix3(hillA, skyLow, 0.1 + smooth(0.4, 0.7, n2) * 0.25);
+        col = mix3(col, rgb("#6fa8a8"), Math.exp(-(y - rA) / 7) * 0.5);
+      } else if (y < hz) {
+        col = mix3(hillB, hillB2, smooth(0.35, 0.65, n2));
+        col = mix3(col, rgb("#5d9a78"), Math.exp(-(y - rB) / 6) * 0.45);
+      } else {
+        const u = clamp((y - hz) / (H - hz));
+        col = u < 0.4 ? mix3(far, lit, u / 0.4) : mix3(lit, near, (u - 0.4) / 0.6);
+        col = mix3(col, far, smooth(0.5, 0.7, n1) * 0.55);
+        col = mix3(col, rgb("#5f9e58"), smooth(0.55, 0.72, n2) * 0.32 * (0.3 + u));
+        col = mix3(col, rgb("#7fb060"), Math.exp(-(y - hz) / 6) * 0.35);
+      }
+      const gran = 1 + (nz.n(x / 2.6, y / 2.6) - 0.5) * 0.045 + (nz.fbm(x / 8, y / 8, 2) - 0.5) * 0.06;
+      const i = (y * W + x) * 4;
+      d[i] = col[0] * gran; d[i + 1] = col[1] * gran; d[i + 2] = col[2] * gran; d[i + 3] = 255;
+    }
+  }
+  g.putImageData(img, 0, 0);
+  skyC = c;
+
+  // Soft wet dabs: distant bushes along the hills.
+  const dab = (px, py, radius, col, alpha) => {
+    const grad = g.createRadialGradient(px, py, radius * 0.1, px, py, radius);
+    grad.addColorStop(0, `rgba(${col.map(Math.round)},${alpha})`);
+    grad.addColorStop(0.75, `rgba(${col.map(Math.round)},${alpha * 0.9})`);
+    grad.addColorStop(1, `rgba(${col.map(Math.round)},0)`);
+    g.fillStyle = grad;
+    g.beginPath();
+    g.ellipse(px, py, radius, radius * (0.72 + r() * 0.2), r() * 3, 0, 7);
+    g.fill();
+  };
+  for (let i = 0; i < 26; i++) {
+    const bx = r() * W, by = horizon(bx) + 2 + r() * 8, tone = r();
+    const col = tone < 0.6 ? rgb("#6da373") : tone < 0.9 ? rgb("#8fb86b") : rgb("#e8cf6c");
+    for (let k = 0; k < 9; k++) dab(bx + (r() - 0.5) * 54, by - r() * 18, 6 + r() * 10, col, 0.7);
+  }
+
+  // Meadow strokes and flowers, bigger towards the viewer. The caption band is kept quiet.
+  const grass = [rgb("#6fa956"), rgb("#8dc064"), rgb("#a8cf6e"), rgb("#5d9a55")];
+  for (let i = 0; i < 5200; i++) {
+    const v = r() ** 0.8, y = 730 + v * (H - 720), x = r() * W, s = 0.35 + v * 1.25;
+    const col = grass[Math.floor(r() * 4)];
+    g.strokeStyle = `rgba(${col.map(Math.round)},${0.16 + r() * 0.3})`;
+    g.lineWidth = 1.2 + s * 1.5;
+    g.lineCap = "round";
+    g.beginPath();
+    g.moveTo(x, y);
+    g.quadraticCurveTo(x + (r() - 0.5) * 14 * s, y - 14 * s, x + (r() - 0.5) * 30 * s, y - (20 + r() * 30) * s);
+    g.stroke();
+  }
+  const blooms = [rgb("#f4a6b8"), rgb("#fff6e6"), rgb("#f8c64f"), rgb("#ee7b2c"), rgb("#ec8fa8"), rgb("#fff6e6")];
+  for (let i = 0; i < 1500; i++) {
+    const v = r() ** 1.1, y = 740 + v * (H - 730), x = r() * W, s = 0.32 + v * 1.25;
+    if (Math.abs(y - CAPTION_Y) < 76 && Math.abs(x - 540) < 420 && r() < 0.92) continue;
+    if (nz.fbm(x / 170 + 11, y / 120, 3) < 0.46) continue;
+    const col = blooms[Math.floor(r() * 6)], radius = (3.5 + r() * 5.5) * s;
+    for (let k = 0; k < 5; k++) {
+      const a = (k / 5) * 6.28 + r();
+      g.fillStyle = `rgba(${col.map(Math.round)},0.85)`;
+      g.beginPath();
+      g.ellipse(x + Math.cos(a) * radius, y + Math.sin(a) * radius * 0.7, radius * 0.8, radius * 0.6, a, 0, 7);
+      g.fill();
+    }
+    g.fillStyle = "rgba(240,170,60,0.9)";
+    g.beginPath();
+    g.arc(x, y, radius * 0.42, 0, 7);
+    g.fill();
+  }
+
+  paintClouds();
+  // The land again, without the sky, so clouds can drift behind the hills.
+  landC = layer();
+  const lg = landC.getContext("2d"), li = g.getImageData(0, 0, W, 800), ld = li.data;
+  for (let x = 0; x < W; x++) { const top = Math.floor(ridgeA(x)); for (let y = 0; y < top; y++) ld[(y * W + x) * 4 + 3] = 0; }
+  lg.putImageData(li, 0, 0);
+  paintTree();
+  paintHive();
+
+  // The meadow fills the frame except for a thin ragged paper edge.
+  D2 = new Float32Array(W * H);
+  F2 = new Float32Array(W * H);
+  const n2 = makeNoise(43);
+  const lx = E.x - O.x, ly = E.y - O.y, ll = lx * lx + ly * ly;
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const i = y * W + x, u = clamp(((x - O.x) * lx + (y - O.y) * ly) / ll);
+      const dist = Math.hypot(x - O.x - lx * u, y - O.y - ly * u);
+      D2[i] = dist * 1.15 + u * FAR * 0.85 + (n2.fbm(x / 170, y / 170, 3) - 0.5) * 150 + (n2.fbm(x / 40, y / 40, 2) - 0.5) * 26 + 80;
+      const inset = Math.min(x, y, W - 1 - x, H - 1 - y) - 18;
+      F2[i] = inset + (n2.fbm(x / 90 + 6, y / 90 + 2, 3) - 0.5) * 34;
+    }
+  }
+  revealC = layer();
+  revealImg = revealC.getContext("2d").createImageData(W, H);
+  rimC = layer();
+  rimImg = rimC.getContext("2d").createImageData(W, H);
+}
+
+function paintClouds() {
+  const cw = W + 220, c = layer(cw, 700), g = c.getContext("2d"), img = g.createImageData(cw, 700), d = img.data, nz = makeNoise(44), r = rng(45);
+  const puffs = [];
+  const cluster = (cx, cy, wide, tall, n) => {
+    for (let i = 0; i < n; i++) {
+      const u = (r() - 0.5) * 2, size = (1 - Math.abs(u) * 0.55) * tall * (0.5 + r() * 0.5);
+      puffs.push({ x: cx + u * wide, y: cy - r() * tall * 0.7 * (1 - Math.abs(u)), r: size });
+    }
+  };
+  cluster(120, 560, 230, 120, 16);
+  cluster(760, 210, 260, 100, 14);
+  cluster(650, 610, 150, 84, 11);
+  cluster(380, 120, 150, 50, 8);
+  const white = rgb("#fffbf2"), shade = rgb("#c8d7ea"), warm = rgb("#ffe9c8");
+  for (let y = 0; y < 700; y++) {
+    for (let x = 0; x < cw; x++) {
+      let h = 0, lift = 0;
+      for (const p of puffs) {
+        const q = 1 - ((x - p.x) ** 2 + ((y - p.y) * 1.25) ** 2) / (p.r * p.r);
+        if (q > h) { h = q; lift = (y - p.y) / p.r; }
+      }
+      if (h <= 0) continue;
+      const warp = (nz.fbm(x / 60, y / 60, 3) - 0.5) * 0.5;
+      const v = h + warp;
+      if (v < 0.14) continue;
+      let col = mix3(white, shade, smooth(-0.1, 0.8, lift + (nz.fbm(x / 80 + 5, y / 80, 3) - 0.5) * 0.9) * 0.9);
+      col = mix3(col, warm, smooth(0.25, 0.7, nz.fbm(x / 140, y / 140 + 9, 2)) * 0.3);
+      const j = (y * cw + x) * 4;
+      d[j] = col[0]; d[j + 1] = col[1]; d[j + 2] = col[2]; d[j + 3] = smooth(0.14, 0.2, v) * 240;
+    }
+  }
+  g.putImageData(img, 0, 0);
+  cloudC = c;
+}
+
+function paintTree() {
+  const c = layer(), g = c.getContext("2d"), r = rng(46), spots = [];
+  const bark = rgb("#4f3029"), barkLit = rgb("#7d5240");
+  const curve = (pts, width, tail = 0.35) => {
+    // A tapering stroke along a smooth path.
+    const line = even(spline(pts), 60);
+    for (let i = 0; i < line.length - 1; i++) {
+      const u = i / (line.length - 1);
+      g.strokeStyle = `rgb(${mix3(bark, barkLit, 0.15 + 0.3 * Math.sin(u * 9 + width)).map(Math.round)})`;
+      g.lineWidth = mix(width, width * tail, u);
+      g.lineCap = "round";
+      g.beginPath();
+      g.moveTo(line[i].x, line[i].y);
+      g.lineTo(line[i + 1].x, line[i + 1].y);
+      g.stroke();
+    }
+    return line;
+  };
+  // A spray: a thin shoot with short twigs, flowers set along it in loose knots.
+  const shoots = [];
+  const spray = (x, y, ang, len, depth) => {
+    const bend = (r() - 0.5) * 0.7, end = { x: x + Math.cos(ang) * len, y: y + Math.sin(ang) * len };
+    const mid = { x: (x + end.x) / 2 + Math.cos(ang + 1.57) * len * bend * 0.3, y: (y + end.y) / 2 + Math.sin(ang + 1.57) * len * bend * 0.3 };
+    const pts = [{ x, y }, mid, end], width = depth === 1 ? 5.5 : 3;
+    const line = curve(pts, width, 0.5);
+    shoots.push({ pts, width });
+    for (let u = 0.3; u <= 1; u += 0.34) spots.push(sample(line, u));
+    if (depth > 0) {
+      const kids = 2 + Math.floor(r() * 2);
+      for (let k = 0; k < kids; k++) {
+        const p = sample(line, 0.3 + (k / kids) * 0.62), side = k % 2 ? 1 : -1;
+        spray(p.x, p.y, ang + side * (0.55 + r() * 0.5), len * (0.5 + r() * 0.2), depth - 1);
+      }
+    }
+  };
+  const bough = (pts, width, sprays, reach) => {
+    const line = curve(pts, width);
+    for (let k = 0; k < sprays; k++) {
+      const u = 0.25 + (k / sprays) * 0.75, p = sample(line, Math.min(u, 0.99)), q = sample(line, Math.min(u + 0.02, 1));
+      const along = angleBetween(p, q), side = k % 2 ? 1 : -1;
+      spray(p.x, p.y, along + side * (0.5 + r() * 0.5), reach * (0.75 + r() * 0.5), 1);
+    }
+    const last = line[line.length - 1], before = line[line.length - 6];
+    spray(last.x, last.y, angleBetween(before, last), reach, 1);
+  };
+  // The trunk stands at the frame edge on the far meadow; boughs reach left, away from the sun.
+  const trunk = curve([{ x: 1070, y: 752 }, { x: 1052, y: 600 }, { x: 1076, y: 400 }, { x: 1062, y: 100 }, { x: 1070, y: -60 }], 82, 0.7);
+  for (let i = 0; i < 90; i++) {
+    const p = sample(trunk, r()), len = 30 + r() * 60;
+    g.strokeStyle = r() < 0.5 ? "rgba(140,96,74,0.4)" : "rgba(40,22,18,0.35)";
+    g.lineWidth = 2 + r() * 3;
+    g.beginPath();
+    g.moveTo(p.x + (r() - 0.5) * 56, p.y);
+    g.lineTo(p.x + (r() - 0.5) * 56, p.y - len);
+    g.stroke();
+  }
+  // Grass over the foot of the trunk, so it stands in the meadow.
+  for (let i = 0; i < 70; i++) {
+    const x = 990 + r() * 100, y = 748 + r() * 26;
+    g.strokeStyle = ["#6fa956", "#8dc064", "#a8cf6e"][Math.floor(r() * 3)];
+    g.lineWidth = 2 + r() * 2;
+    g.lineCap = "round";
+    g.beginPath();
+    g.moveTo(x, y);
+    g.quadraticCurveTo(x + (r() - 0.5) * 8, y - 12, x + (r() - 0.5) * 16, y - 18 - r() * 16);
+    g.stroke();
+  }
+  bough([{ x: 1050, y: 575 }, { x: 960, y: 530 }, { x: 880, y: 566 }, { x: 790, y: 560 }], 34, 6, 130);
+  bough([{ x: 1060, y: 400 }, { x: 960, y: 380 }, { x: 860, y: 318 }, { x: 740, y: 330 }], 30, 6, 140);
+  bough([{ x: 1060, y: 200 }, { x: 960, y: 170 }, { x: 870, y: 100 }, { x: 770, y: 80 }], 24, 5, 120);
+
+  // One small flower: five separate petals.
+  const flower = (px, py, radius, col, a) => {
+    g.fillStyle = col;
+    for (let k = 0; k < 5; k++) {
+      const pa = (k / 5) * 6.2832 + a;
+      g.beginPath();
+      g.ellipse(px + Math.cos(pa) * radius * 0.62, py + Math.sin(pa) * radius * 0.62, radius * 0.58, radius * 0.42, pa, 0, 7);
+      g.fill();
+    }
+  };
+  // Knots of flowers, shaded dark to light: lower right in shadow, upper left towards the sun.
+  const tones = ["#cf6486", "#e6839f", "#f09db3", "#f7b9c8", "#fcd6de", "#fff0f1"];
+  const stamps = [];
+  for (const spot of spots) {
+    const light = clamp(0.5 - (spot.x - 880) / 700 - (spot.y - 330) / 900);
+    const count = 4 + Math.floor(r() * 4);
+    for (let i = 0; i < count; i++) {
+      const a = r() * 6.28, q = Math.sqrt(r()) * 25;
+      stamps.push({ x: spot.x + Math.cos(a) * q, y: spot.y + Math.sin(a) * q * 0.9, tone: clamp(light * 0.75 + (r() - 0.32) * 0.62 - Math.sin(a) * q / 100), a: r() * 6, radius: 7 + r() * 6 });
+    }
+  }
+  stamps.sort((p, q) => p.tone - q.tone);
+  for (const st of stamps) {
+    const col = tones[Math.min(5, Math.floor(st.tone * 6))];
+    flower(st.x, st.y, st.radius, col, st.a);
+    if (st.tone > 0.5 && r() < 0.5) { g.fillStyle = "rgba(214,96,110,0.75)"; g.beginPath(); g.arc(st.x, st.y, 1.8, 0, 7); g.fill(); }
+  }
+  // Some twigs back over the blossom, so it reads as a branch in flower, not a cloud.
+  for (const shoot of shoots) if (r() < 0.45) curve(shoot.pts, shoot.width * 0.8, 0.45);
+  treeC = c;
+}
+
+function paintHive() {
+  const c = layer(420, 360), g = c.getContext("2d"), r = rng(47), cx = 210, base = 268, bands = 8;
+  const glow = g.createRadialGradient(cx, base + 14, 10, cx, base + 14, 180);
+  glow.addColorStop(0, "rgba(70,110,50,0.5)");
+  glow.addColorStop(1, "rgba(70,110,50,0)");
+  g.fillStyle = glow;
+  g.save();
+  g.translate(0, base + 14); g.scale(1, 0.25); g.translate(0, -(base + 14));
+  g.fillRect(0, 0, 420, 800);
+  g.restore();
+  const light = rgb("#f9cf73"), mid = rgb("#eda63a"), dark = rgb("#bf6f22");
+  for (let b = 0; b < bands; b++) {
+    const u = b / (bands - 1), y = base - u * 190, half = 122 * Math.sqrt(1 - u * u * 0.94) + 4, hgt = 31;
+    const grad = g.createLinearGradient(cx - half, 0, cx + half, 0);
+    grad.addColorStop(0, `rgb(${mix3(light, mid, 0.2).map(Math.round)})`);
+    grad.addColorStop(0.45, `rgb(${mid.map(Math.round)})`);
+    grad.addColorStop(1, `rgb(${dark.map(Math.round)})`);
+    g.fillStyle = grad;
+    g.beginPath();
+    g.roundRect(cx - half, y - hgt, half * 2, hgt + 3, 15);
+    g.fill();
+    g.strokeStyle = "rgba(150,80,30,0.32)";
+    g.lineWidth = 2.4;
+    g.stroke();
+    for (let k = 0; k < half / 5; k++) {
+      const sx = cx - half + 8 + r() * (half * 2 - 16);
+      g.strokeStyle = `rgba(255,234,170,${0.25 + r() * 0.3})`;
+      g.lineWidth = 1.6;
+      g.beginPath();
+      g.moveTo(sx, y - hgt + 6);
+      g.lineTo(sx + 6, y - 3);
+      g.stroke();
+    }
+  }
+  g.fillStyle = "#4a2a1c";
+  g.beginPath();
+  g.ellipse(cx, base - 14, 34, 30, 0, Math.PI, 0);
+  g.lineTo(cx + 34, base + 2);
+  g.lineTo(cx - 34, base + 2);
+  g.closePath();
+  g.fill();
+  // Paint it in: uneven pigment over the whole shape, so it belongs to the meadow.
+  g.globalCompositeOperation = "source-atop";
+  for (let i = 0; i < 90; i++) {
+    const warm = r() < 0.5;
+    g.fillStyle = warm ? `rgba(255,236,170,${0.05 + r() * 0.1})` : `rgba(170,84,30,${0.04 + r() * 0.1})`;
+    g.beginPath();
+    g.ellipse(70 + r() * 280, 60 + r() * 230, 14 + r() * 34, 8 + r() * 20, r() * 3, 0, 7);
+    g.fill();
+  }
+  g.globalCompositeOperation = "source-over";
+  hiveC = c;
+}
+
+// ---------- the bee ----------
+function buildBee() {
+  const S = 2, make = (w, h) => { const c = layer(w * S, h * S), g = c.getContext("2d"); g.scale(S, S); g.translate(w / 2, h / 2); return [c, g]; };
+  const r = rng(51), nz = makeNoise(52);
+
+  // Abdomen: plump and rounded, nose at (0,0), tail towards -x.
+  const [ab, a] = make(190, 130);
+  a.translate(72, 0);
+  const abPath = () => {
+    a.beginPath();
+    a.moveTo(6, 0);
+    a.bezierCurveTo(4, -34, -40, -54, -84, -42);
+    a.bezierCurveTo(-118, -30, -138, -12, -142, 0);
+    a.bezierCurveTo(-138, 12, -118, 30, -84, 42);
+    a.bezierCurveTo(-40, 54, 4, 34, 6, 0);
+    a.closePath();
+  };
+  abPath();
+  a.save();
+  a.clip();
+  const base = a.createLinearGradient(0, -52, 0, 52);
+  base.addColorStop(0, "#ffd878");
+  base.addColorStop(0.5, "#fbb03b");
+  base.addColorStop(1, "#ee7f24");
+  a.fillStyle = base;
+  a.fillRect(-150, -70, 170, 140);
+  // Stripes follow the curve of the body, with soft, painted edges.
+  a.filter = "blur(1.2px)";
+  [-30, -62, -94, -124].forEach((x, i) => {
+    a.strokeStyle = "#4a2a1c";
+    a.lineWidth = 19 - i * 1.5;
+    a.beginPath();
+    a.moveTo(x + 9, -60);
+    a.quadraticCurveTo(x - 12, 0, x + 9, 60);
+    a.stroke();
+  });
+  a.filter = "none";
+  // Soft lighter patches, as on the reference's creatures, and shading to make it round.
+  for (let i = 0; i < 30; i++) {
+    a.fillStyle = `rgba(255,${205 + r() * 40},${130 + r() * 70},${0.05 + r() * 0.11})`;
+    a.beginPath();
+    a.ellipse(-r() * 130, (r() - 0.5) * 80, 8 + r() * 18, 5 + r() * 10, r() * 3, 0, 7);
+    a.fill();
+  }
+  const sheen = a.createRadialGradient(-56, -26, 2, -56, -26, 62);
+  sheen.addColorStop(0, "rgba(255,246,220,0.45)");
+  sheen.addColorStop(1, "rgba(255,246,220,0)");
+  a.fillStyle = sheen;
+  a.fillRect(-150, -70, 170, 140);
+  const under = a.createLinearGradient(0, 8, 0, 52);
+  under.addColorStop(0, "rgba(150,50,40,0)");
+  under.addColorStop(1, "rgba(150,50,40,0.34)");
+  a.fillStyle = under;
+  a.fillRect(-150, -70, 170, 140);
+  a.restore();
+
+  // Thorax and head, centred on the thorax, facing +x.
+  const [th, b] = make(170, 130);
+  const fur = b.createRadialGradient(-6, -10, 3, 0, 0, 38);
+  fur.addColorStop(0, "#f8cb76");
+  fur.addColorStop(0.6, "#e8a23f");
+  fur.addColorStop(1, "#bf7128");
+  b.fillStyle = fur;
+  b.beginPath();
+  b.ellipse(0, 0, 36, 35, 0, 0, 7);
+  b.fill();
+  // Short combed fur: soft and mostly lying back along the body, longer only at the rim.
+  for (let i = 0; i < 520; i++) {
+    const ang = r() * 6.28, q = Math.sqrt(r()) * 37, x = Math.cos(ang) * q, y = Math.sin(ang) * q;
+    const dir = Math.PI + (y / 37) * -0.9 + (r() - 0.5) * 0.9, len = 3.5 + r() * 5 + (q > 30 ? 3 : 0);
+    const lit = clamp(0.55 - y / 60 + (r() - 0.5) * 0.45);
+    b.strokeStyle = `rgba(${mix3(rgb("#b4661f"), rgb("#ffe3a4"), lit).map(Math.round)},0.6)`;
+    b.lineWidth = 1.6;
+    b.lineCap = "round";
+    b.beginPath();
+    b.moveTo(x, y);
+    b.lineTo(x + Math.cos(dir) * len, y + Math.sin(dir) * len);
+    b.stroke();
+  }
+  // Head: small, dark, two glossy eyes. No face to act with, which suits code.
+  const head = b.createRadialGradient(46, -6, 3, 48, 0, 26);
+  head.addColorStop(0, "#6a4230");
+  head.addColorStop(1, "#3b2016");
+  b.fillStyle = head;
+  b.beginPath();
+  b.ellipse(48, 0, 20, 24, 0, 0, 7);
+  b.fill();
+  for (const side of [-1, 1]) {
+    b.fillStyle = "#24120e";
+    b.beginPath();
+    b.ellipse(50, side * 16, 12, 8.5, side * 0.4, 0, 7);
+    b.fill();
+    b.fillStyle = "rgba(255,240,225,0.75)";
+    b.beginPath();
+    b.ellipse(53, side * 16 - 3, 3.2, 2, 0.3, 0, 7);
+    b.fill();
+  }
+
+  // One wing, root at (0,0), tip towards +x.
+  const [wing, w] = make(320, 130);
+  w.translate(-140, 0);
+  const wingPath = () => {
+    w.beginPath();
+    w.moveTo(0, 0);
+    w.bezierCurveTo(40, -36, 130, -46, 176, -24);
+    w.bezierCurveTo(206, -8, 190, 22, 150, 26);
+    w.bezierCurveTo(100, 30, 40, 18, 0, 0);
+    w.closePath();
+  };
+  wingPath();
+  const wf = w.createLinearGradient(0, 0, 190, 0);
+  wf.addColorStop(0, "rgba(255,250,240,0.5)");
+  wf.addColorStop(1, "rgba(226,240,250,0.42)");
+  w.fillStyle = wf;
+  w.fill();
+  w.strokeStyle = "rgba(255,255,255,0.9)";
+  w.lineWidth = 2;
+  w.stroke();
+  w.lineWidth = 1.5;
+  w.strokeStyle = "rgba(255,255,255,0.65)";
+  [[60, -24, 170, -16], [40, -6, 186, 2], [50, 8, 150, 20]].forEach(([x1, y1, x2, y2]) => {
+    w.beginPath();
+    w.moveTo(0, 0);
+    w.quadraticCurveTo(x1, y1, x2, y2);
+    w.stroke();
+  });
+
+  // A soft silhouette for the shadow.
+  const [sh, s] = make(320, 170);
+  s.filter = "blur(11px)";
+  s.fillStyle = "rgba(120,28,60,1)";
+  s.beginPath();
+  s.ellipse(-24, 0, 112, 46, 0, 0, 7);
+  s.ellipse(66, 0, 34, 28, 0, 0, 7);
+  s.fill();
+
+  bee = { ab, th, wing, sh, S };
+}
+
+function drawLegs(g, phase, pollen) {
+  g.lineCap = "round";
+  g.lineJoin = "round";
+  [[42, 0.5, 40], [24, 1.9, 44], [8, 3.4, 54]].forEach(([hip, offset, reach], i) => {
+    for (const side of [-1, 1]) {
+      const swing = Math.sin(phase + offset + (side > 0 ? Math.PI : 0)) * 0.28;
+      const a = side * (i === 0 ? 0.85 : i === 1 ? 1.55 : 2.25) + swing * side;
+      const kx = hip + Math.cos(a) * reach * 0.62, ky = side * 24 + Math.sin(a) * reach * 0.62;
+      const fx = kx + Math.cos(a + side * 0.55 * (i === 2 ? -1 : 1)) * reach * 0.72, fy = ky + Math.sin(a + side * 0.55 * (i === 2 ? -1 : 1)) * reach * 0.72;
+      g.strokeStyle = "#5a3424";
+      g.lineWidth = i === 2 ? 4.6 : 3.6;
+      g.beginPath();
+      g.moveTo(hip, side * 22);
+      g.lineTo(kx, ky);
+      g.lineTo(fx, fy);
+      g.stroke();
+      if (i === 2 && pollen) {
+        const px = mix(kx, fx, 0.45), py = mix(ky, fy, 0.45);
+        const ball = g.createRadialGradient(px - 4, py - 5, 1, px, py, 15);
+        ball.addColorStop(0, "#ffe08a");
+        ball.addColorStop(0.5, "#f59a2d");
+        ball.addColorStop(1, "#d9632a");
+        g.fillStyle = ball;
+        g.beginPath();
+        g.ellipse(px, py, 15, 13, a, 0, 7);
+        g.fill();
+      }
+    }
+  });
+}
+
+function drawBee(x, y, heading, scale, o = {}) {
+  const { wag = 0, buzz = 0, phase = 0, antenna = 0, pollen = false, lift = 1, alpha = 1 } = o, S = bee.S;
+  const img = (c) => ctx.drawImage(c, -c.width / S / 2, -c.height / S / 2, c.width / S, c.height / S);
+  ctx.save();
+  ctx.globalAlpha = alpha;
+  // Shadow, cast away from the light in screen space.
+  ctx.save();
+  ctx.translate(x + 12 * scale * lift, y + 16 * scale * lift);
+  ctx.rotate(heading);
+  ctx.scale(scale, scale);
+  ctx.globalAlpha = alpha * 0.42 / Math.sqrt(lift);
+  img(bee.sh);
+  ctx.restore();
+
+  ctx.translate(x, y);
+  ctx.rotate(heading);
+  ctx.scale(scale, scale);
+  drawLegs(ctx, phase, pollen);
+
+  // Abdomen pivots at the waist: this is the waggle.
+  ctx.save();
+  ctx.translate(-30, 0);
+  ctx.rotate(wag * 0.42);
+  ctx.translate(-34, 0);
+  img(bee.ab);
+  ctx.restore();
+
+  // Wings: folded back at rest, a blur of ghost positions when buzzing.
+  for (const side of [-1, 1]) {
+    const rest = Math.PI - side * 0.2 * -1;
+    const copies = buzz > 0.02 ? 4 : 1;
+    for (let k = 0; k < copies; k++) {
+      const spread = (buzz * 0.62 + (copies > 1 ? (k / (copies - 1) - 0.5) * 0.5 * buzz : 0));
+      const ang = side * (Math.PI - 0.2 - spread);
+      ctx.save();
+      ctx.translate(8, side * 15);
+      ctx.rotate(ang + wag * 0.2);
+      ctx.globalAlpha = alpha * (copies > 1 ? 0.42 : 0.95);
+      ctx.scale(0.74, side * 0.78);
+      ctx.translate(160 - 20, 0);
+      img(bee.wing);
+      ctx.restore();
+    }
+  }
+
+  // Thorax sprite is centred on the thorax.
+  ctx.translate(24, 0);
+  img(bee.th);
+
+  // Antennae, feeling forward.
+  ctx.strokeStyle = "#4a2a1c";
+  ctx.lineWidth = 3;
+  ctx.lineCap = "round";
+  for (const side of [-1, 1]) {
+    const flick = Math.sin(antenna + side) * 0.2;
+    ctx.beginPath();
+    ctx.moveTo(66, side * 8);
+    ctx.lineTo(88, side * 20);
+    ctx.lineTo(112 + flick * 16, side * (14 + flick * 24));
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+
+// ---------- things that move ----------
+const R0 = rng(61);
+const SISTERS = [
+  { x: 906, y: 1160, from: { x: 1180, y: 1200 }, at: 2.7 },
+  { x: 806, y: 1372, from: { x: 1180, y: 1420 }, at: 3.0 },
+  { x: 176, y: 1318, from: { x: -120, y: 1420 }, at: 3.25 },
+  { x: 130, y: 890, from: { x: -130, y: 820 }, at: 3.45 },
+  { x: 236, y: 640, from: { x: 120, y: 160 }, at: 3.7 },
+  { x: 880, y: 760, from: { x: 1180, y: 640 }, at: 3.9 },
+].map((s, i) => ({ ...s, seed: R0() * 6.28, launch: 11.3 + [0.22, 0.44, 0.88, 1.1, 0.66, 0.0][i], join: 200 + i * 40, wobble: i % 2 ? 1 : -1 }));
+
+function flightPos(from, join, u) {
+  // Ease off the comb onto the line, then follow the line to the blossom.
+  const along = at(mix(join * 0.4, FAR, u ** 1.3)), blend = smooth(0, 0.32, u);
+  return { x: mix(from.x, along.x, blend), y: mix(from.y, along.y, blend) };
+}
+function orbit(i, t) {
+  const a = t * (1.1 + i * 0.13) + i * 1.9, b = t * 0.7 + i;
+  return { x: E.x - 12 + Math.cos(a) * (70 + i * 13) + Math.sin(b) * 22, y: E.y - 30 + Math.sin(a * 1.3) * (46 + i * 10) };
+}
+function sisterAt(s, i, t) {
+  const walk = easeOut(progress(t, s.at, s.at + 1.1));
+  const shuffle = Math.sin(t * 1.3 + s.seed) * 7, sway = Math.cos(t * 0.9 + s.seed * 2) * 6;
+  const x = mix(s.from.x, s.x, walk) + shuffle, y = mix(s.from.y, s.y, walk) + sway;
+  return { x, y };
+}
+
+function drawSisters(t) {
+  SISTERS.forEach((s, i) => {
+    if (t < s.at) return;
+    if (t < s.launch) {
+      const p = sisterAt(s, i, t), walking = progress(t, s.at, s.at + 1.1) < 1;
+      const walkDir = angleBetween(s.from, s), watch = angleBetween(p, dancerAt(t - 0.25));
+      const facing = walkDir + turn(walkDir, watch) * smooth(0.55, 1, progress(t, s.at, s.at + 1.1));
+      drawBee(p.x, p.y, facing, 0.8, { phase: t * (walking ? 15 : 3.5) + s.seed, antenna: t * 5 + s.seed, buzz: 0 });
+      return;
+    }
+    const base = sisterAt(s, i, s.launch);
+    const u = progress(t, s.launch, s.launch + 1.4);
+    const pos = (tt) => {
+      const uu = progress(tt, s.launch, s.launch + 1.4), a = flightPos(base, s.join, uu), b = orbit(i, tt);
+      const settle = smooth(0.86, 1, uu), weave = Math.sin(uu * 9 + s.seed) * 15 * Math.sin(uu * Math.PI);
+      return { x: mix(a.x + N.x * weave, b.x, settle), y: mix(a.y + N.y * weave, b.y, settle) };
+    };
+    const p = pos(t), q = pos(t + 0.04), dist = Math.hypot(q.x - p.x, q.y - p.y);
+    const take = easeOut(progress(t, s.launch, s.launch + 0.25));
+    const start = angleBetween(base, dancerAt(s.launch - 0.25));
+    const heading = dist > 0.3 ? start + turn(start, angleBetween(p, q)) * take : start;
+    const size = mix(0.8, 0.32, easeOut(clamp(u * 1.5)));
+    drawBee(p.x, p.y, heading, size, { buzz: take, phase: t * 20, antenna: t * 9, lift: 1 + take * 2 });
+  });
+}
+
+function drawDancer(t) {
+  if (t < ROUTE[0].t0) return;
+  const heading = dancerHeading(t);
+  if (t >= 10.1) {
+    // She has said it. She stays at the door, shrinking as the world opens around her.
+    const size = mix(1.0, 0.5, easeInOut(progress(t, 11.1, 12.5)));
+    drawBee(O.x, O.y - 8 * progress(t, 11.1, 12.5), heading, size, { phase: 0, antenna: t * 4, pollen: true, buzz: 0.12 + 0.1 * Math.sin(t * 3) });
+    return;
+  }
+  const d = dancerAt(t), waggling = d.seg && d.seg.waggle;
+  const flying = d.seg === ROUTE[0];
+  const shake = waggling ? Math.sin((t - d.seg.t0) * 2 * Math.PI * 6) : 0;
+  const envelope = waggling ? smooth(0, 0.06, t - d.seg.t0) * smooth(0, 0.06, d.seg.t1 - t) : 0;
+  const nx = -Math.sin(heading), ny = Math.cos(heading);
+  const shift = shake * envelope * 9;
+  drawBee(d.x + nx * shift, d.y + ny * shift, heading + shake * envelope * 0.13, 1.0, {
+    wag: shake * envelope,
+    buzz: flying ? 1 : waggling ? 0.55 : 0,
+    phase: t * (d.seg ? 18 : 3),
+    antenna: t * 7,
+    pollen: t < 11,
+    lift: flying ? 2.6 : 1,
+  });
+}
+
+function wobblyRing(x, y, radius, seed, width, alpha, colour = "255,255,255") {
+  ctx.beginPath();
+  for (let i = 0; i <= 72; i++) {
+    const a = (i / 72) * 6.2832, q = radius * (1 + 0.018 * Math.sin(a * 3 + seed) + 0.011 * Math.sin(a * 7 + seed * 2));
+    const px = x + Math.cos(a) * q, py = y + Math.sin(a) * q;
+    if (i) ctx.lineTo(px, py); else ctx.moveTo(px, py);
+  }
+  ctx.strokeStyle = `rgba(${colour},${alpha})`;
+  ctx.lineWidth = width;
+  ctx.stroke();
+}
+
+// Ripples shaken off by each waggle, and the rings where the drop lands.
+function drawRings(t) {
+  const landing = [0.14, 0.42, 0.72, 1.05];
+  landing.forEach((e, i) => {
+    const age = t - e;
+    if (age < 0 || age > 2.2) return;
+    const u = age / 2.2;
+    wobblyRing(O.x, O.y, 10 + easeOut(u) * 330, i * 2.1, 4 - u * 2, (1 - u) ** 1.4 * 0.95);
+  });
+  for (const seg of ROUTE) {
+    if (!seg.waggle) continue;
+    for (let e = seg.t0 + 0.04; e < seg.t1; e += 1 / 6) {
+      const age = t - e;
+      if (age < 0 || age > 1.1) continue;
+      const u = age / 1.1, p = sample(seg.pts, (e - seg.t0) / (seg.t1 - seg.t0));
+      wobblyRing(p.x, p.y, 40 + easeOut(u) * 190, e * 13, 3.2 - u * 1.8, (1 - u) ** 1.5 * 0.7);
+    }
+  }
+}
+
+// The white line: every segment she has finished, plus the one in progress, hand-wobbled.
+function linePoints(pts, u, seed) {
+  const out = [], last = Math.floor(clamp(u) * (pts.length - 1));
+  for (let i = 0; i <= last; i++) {
+    const a = i / pts.length * 9 + seed;
+    const nx = Math.sin(a * 1.7) * 1.4 + Math.sin(a * 4.3 + seed) * 0.7;
+    out.push({ x: pts[i].x + nx, y: pts[i].y + Math.cos(a * 2.1) * 1.2 });
+  }
+  if (u < 1 && out.length) out.push(sample(pts, u));
+  return out;
+}
+function stroke(points, width, style) {
+  if (points.length < 2) return;
+  ctx.beginPath();
+  points.forEach((p, i) => (i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y)));
+  ctx.lineWidth = width;
+  ctx.lineCap = "round";
+  ctx.lineJoin = "round";
+  ctx.strokeStyle = style;
+  ctx.stroke();
+}
+function drawLine(t) {
+  const trails = [];
+  ROUTE.forEach((seg, i) => {
+    if (t < seg.t0) return;
+    trails.push(linePoints(seg.pts, fractionOf(seg, t), i * 1.37));
+  });
+  // The payoff: the same line keeps going at the same angle.
+  const extend = easeOut(progress(t, 11.1, 12.2));
+  if (extend > 0) trails.push([P, at(mix(RUN, FAR, extend))]);
+  // Once the world opens, the old figure-eight fades and only the route stays.
+  const fade = 1 - smooth(11.3, 12.4, t) * 0.72;
+  trails.forEach((pts, i) => {
+    const route = extend > 0 && i === trails.length - 1;
+    const landed = i === 0 ? 1 - smooth(3.2, 5.2, t) * 0.65 : 1;
+    const a = route ? 1 : fade * landed;
+    stroke(pts.map((p) => ({ x: p.x + 2, y: p.y + 3 })), 6, `rgba(110,30,60,${0.2 * a})`);
+    stroke(pts, ROUTE[i] && ROUTE[i].waggle ? 6 : 4.4, `rgba(255,255,255,${0.95 * a})`);
+  });
+  if (extend > 0) {
+    const ends = [O, at(mix(RUN, FAR, extend))];
+    stroke(ends.map((p) => ({ x: p.x + 2, y: p.y + 3 })), 9, "rgba(50,80,60,0.28)");
+    stroke(ends, 7, "#ffffff");
+  }
+}
+
+function drawDiagram(t) {
+  // Dashed line straight down from the sun.
+  const drop = easeInOut(progress(t, 5.95, 6.5));
+  if (drop > 0) {
+    const y1 = SUN.y + SUN.r + 14, y2 = mix(y1, O.y, drop);
+    ctx.save();
+    ctx.setLineDash([20, 15]);
+    ctx.lineCap = "round";
+    ctx.lineWidth = 4;
+    ctx.strokeStyle = "rgba(255,255,255,0.9)";
+    ctx.beginPath();
+    ctx.moveTo(SUN.x, y1);
+    ctx.lineTo(SUN.x, y2);
+    ctx.stroke();
+    ctx.restore();
+  }
+  // The wedge between straight up and her run.
+  const sweep = easeInOut(progress(t, 7.0, 7.65));
+  if (sweep > 0) {
+    const start = -Math.PI / 2, end = start + THETA * sweep, radius = 300;
+    ctx.beginPath();
+    ctx.moveTo(O.x, O.y);
+    ctx.arc(O.x, O.y, radius, start, end);
+    ctx.closePath();
+    const wash = ctx.createRadialGradient(O.x, O.y, 30, O.x, O.y, radius), strength = mix(1, 0.6, smooth(11.2, 12.2, t));
+    wash.addColorStop(0, `rgba(255,236,170,${0.5 * strength})`);
+    wash.addColorStop(0.8, `rgba(255,208,92,${0.74 * strength})`);
+    wash.addColorStop(1, `rgba(250,176,60,${0.86 * strength})`);
+    ctx.fillStyle = wash;
+    ctx.fill();
+    ctx.beginPath();
+    ctx.arc(O.x, O.y, radius, start, end);
+    ctx.strokeStyle = "rgba(255,255,255,0.95)";
+    ctx.lineWidth = 4;
+    ctx.stroke();
+  }
+}
+function drawAngleLabel(t) {
+  const pop = backOut(progress(t, 7.55, 7.85));
+  if (pop <= 0) return;
+  // Just outside the wedge's arc, on the sun side of her run, clear of the bee.
+  const q = 356, half = THETA * 0.5;
+  label("30°", O.x + Math.sin(half) * q - 6, O.y - Math.cos(half) * q, 50 * pop);
+}
+function drawDistanceLabel(t) {
+  const pop = backOut(progress(t, 9.15, 9.45));
+  if (pop <= 0) return;
+  const slide = easeOut(progress(t, 11.1, 12.2)), rest = at(mix(RUN, 610, slide), mix(120, -128, slide));
+  label("1 KM", rest.x, rest.y, 50 * pop);
+}
+
+function label(text, x, y, size, colour = "#2a1712") {
+  ctx.font = `600 ${size}px Plex`;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillStyle = colour;
+  ctx.fillText(text, x, y);
+}
+
+// One sweep of a clock around her during the counted run, then the distance tag.
+function drawClock(t) {
+  const seg = ROUTE[7], u = progress(t, seg.t0, seg.t1);
+  if (t >= seg.t0 && t < seg.t1 + 0.3) {
+    const d = dancerAt(Math.min(t, seg.t1 - 0.001)), fade = 1 - progress(t, seg.t1, seg.t1 + 0.3);
+    ctx.beginPath();
+    ctx.arc(d.x, d.y, 136, 0, 6.2832);
+    ctx.strokeStyle = `rgba(255,255,255,${0.3 * fade})`;
+    ctx.lineWidth = 7;
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(d.x, d.y, 136, -Math.PI / 2, -Math.PI / 2 + u * 6.2832);
+    ctx.strokeStyle = `rgba(255,214,110,${fade})`;
+    ctx.lineWidth = 9;
+    ctx.lineCap = "round";
+    ctx.stroke();
+  }
+  const pop = backOut(progress(t, 9.15, 9.45));
+  if (pop > 0) {
+    const slide = easeOut(progress(t, 11.1, 12.2)), p = at(mix(RUN, FAR, slide));
+    wobblyRing(p.x, p.y, 15 * pop, 3, 5, 1);
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, 7 * pop, 0, 7);
+    ctx.fillStyle = "#ffd76a";
+    ctx.fill();
+  }
+}
+
+// Pollen confetti: small rings, crosses, triangles and squiggles.
+const CONFETTI = (() => {
+  const r = rng(71), out = [], cols = ["255,255,255", "255,214,110", "120,190,220", "255,190,120", "190,226,170"];
+  for (let i = 0; i < 46; i++) {
+    const a = r() * 6.28, q = Math.sqrt(r());
+    const x = 540 + Math.cos(a) * q * 440, y = 960 + Math.sin(a) * q * 780;
+    if (Math.abs(y - CAPTION_Y) < 66) continue;
+    out.push({ x, y, kind: Math.floor(r() * 4), size: 9 + r() * 9, col: cols[Math.floor(r() * 5)], seed: r() * 6.28, at: 2.0 + r() * 2.4, spin: (r() - 0.5) * 1.2 });
+  }
+  return out;
+})();
+function drawConfetti(t) {
+  const gone = 1 - smooth(11.2, 12.2, t);
+  if (gone <= 0) return;
+  for (const c of CONFETTI) {
+    const pop = backOut(progress(t, c.at, c.at + 0.28));
+    if (pop <= 0) continue;
+    const x = c.x + Math.sin(t * 0.5 + c.seed) * 12, y = c.y + Math.cos(t * 0.4 + c.seed * 2) * 12 - t * 2;
+    const a = (0.6 + 0.4 * Math.sin(t * 2.1 + c.seed)) * gone;
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.rotate(c.seed + t * c.spin);
+    ctx.scale(pop, pop);
+    ctx.strokeStyle = `rgba(${c.col},${a})`;
+    ctx.fillStyle = "transparent";
+    ctx.lineWidth = 3.6;
+    ctx.lineCap = "round";
+    ctx.lineJoin = "round";
+    const s = c.size;
+    ctx.beginPath();
+    if (c.kind === 0) ctx.arc(0, 0, s, 0, 7);
+    if (c.kind === 1) { ctx.moveTo(-s, 0); ctx.lineTo(s, 0); ctx.moveTo(0, -s); ctx.lineTo(0, s); }
+    if (c.kind === 2) { ctx.moveTo(0, -s); ctx.lineTo(s, s * 0.8); ctx.lineTo(-s, s * 0.8); ctx.closePath(); }
+    if (c.kind === 3) { ctx.moveTo(-s * 1.3, 0); ctx.bezierCurveTo(-s * 0.5, -s * 1.6, s * 0.1, s * 1.6, s * 1.3, -s * 0.3); }
+    ctx.stroke();
+    ctx.restore();
+  }
+}
+
+// Falling petals in the meadow.
+const PETALS = (() => {
+  const r = rng(81), out = [];
+  for (let i = 0; i < 46; i++) out.push({ x: 640 + r() * 460, y: 280 + r() * 420, at: 11.9 + r() * 2.6, v: 0.8 + r() * 0.8, size: 7 + r() * 8, seed: r() * 6.28, col: r() < 0.5 ? "#fbd3dc" : "#f7a9bc" });
+  return out;
+})();
+function drawPetals(t) {
+  for (const p of PETALS) {
+    const age = t - p.at;
+    if (age < 0) continue;
+    const x = p.x - age * 120 * p.v + Math.sin(age * 1.4 + p.seed) * 22, y = p.y + age * 130 * p.v + Math.cos(age * 2 + p.seed) * 12;
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.rotate(p.seed + age * 2.2);
+    ctx.scale(1, 0.45 + 0.4 * Math.sin(age * 3 + p.seed));
+    ctx.globalAlpha = 0.95 * smooth(0, 0.3, age);
+    ctx.fillStyle = p.col;
+    ctx.beginPath();
+    ctx.ellipse(0, 0, p.size, p.size * 0.62, 0, 0, 7);
+    ctx.fill();
+    ctx.restore();
+  }
+}
+
+const CAPTIONS = [
+  [0.22, 1.25, "THIS DANCE"], [1.3, 2.62, "IS A MAP"], [2.85, 4.3, "A BEE FOUND FOOD"], [4.42, 5.72, "SHE DANCES IT"],
+  [5.85, 6.95, "UP MEANS SUN"], [7.02, 8.1, "TILT = DIRECTION"], [8.17, 9.16, "SHAKE 1 SECOND"], [9.22, 10.5, "FLY ABOUT 1 KM"],
+  [11.5, 13.2, "HER SISTERS FLY IT"], [13.35, 15.2, "DIRECTIONS, DANCED."],
+];
+function drawCaption(t) {
+  ctx.font = "600 54px Plex";
+  ctx.letterSpacing = "4px";
+  ctx.textAlign = "left";
+  ctx.textBaseline = "middle";
+  for (const [a, b, text] of CAPTIONS) {
+    if (t < a || t >= b) continue;
+    const words = text.split(" "), widths = words.map((w) => ctx.measureText(w).width), space = ctx.measureText(" ").width;
+    let x = (W - widths.reduce((s, w) => s + w, 0) - space * (words.length - 1)) / 2;
+    const out = 1 - progress(t, b - 0.1, b);
+    words.forEach((word, i) => {
+      const u = progress(t, a + i * 0.08, a + i * 0.08 + 0.16), e = easeOut(u);
+      ctx.fillStyle = `rgba(42,23,18,${e * out})`;
+      ctx.fillText(word, x, CAPTION_Y + (1 - e) * 16);
+      x += widths[i] + space;
+    });
+  }
+  ctx.letterSpacing = "0px";
+}
+
+function drawDrop(t) {
+  // The first drop, before it blooms.
+  const R = t < 0.14 ? 34 * (0.6 + 0.4 * (t / 0.14)) : 34 + backOut(progress(t, 0.14, 0.42)) * 30 + easeIn(progress(t, 0.5, 0.9)) * 70;
+  return R;
+}
+function bloomRadius(t) {
+  const R = drawDrop(t);
+  const u = progress(t, 0.72, 2.3);
+  return R + (1 - (1 - u) ** 2.2) * smooth(0, 0.3, u) * 1750;
+}
+
+function drawMeadow(t) {
+  const R = mix(0, 1750, smooth(0, 1, progress(t, 11.1, 12.6)) ** 0.8);
+  const scene = sceneC.getContext("2d");
+  scene.globalCompositeOperation = "source-over";
+  scene.drawImage(skyC, 0, 0);
+  scene.globalAlpha = 1;
+  scene.drawImage(cloudC, -110 - (t - 12) * 9, 0);
+  scene.drawImage(landC, 0, 0, W, 800, 0, 0, W, 800);
+  const sway = Math.sin(t * 1.1) * 0.0035;
+  scene.save();
+  scene.translate(1040, 800);
+  scene.rotate(sway);
+  scene.translate(-1040, -800);
+  scene.drawImage(treeC, 0, 0);
+  scene.restore();
+  scene.drawImage(hiveC, O.x - 210, O.y - 264);
+
+  const done = R >= 1749;
+  const d = revealImg.data, e = rimImg.data;
+  d.fill(0); e.fill(0);
+  for (let i = 0, n = W * H; i < n; i++) {
+    const inner = Math.min(R - D2[i], F2[i]);
+    if (inner <= 0) continue;
+    const j = i * 4;
+    d[j + 3] = inner > 2.4 ? 255 : inner * 106;
+    const edge = done ? Math.exp(-F2[i] / 9) * 0.3 : Math.exp(-inner / 12) * 0.34;
+    e[j] = 70; e[j + 1] = 96; e[j + 2] = 110; e[j + 3] = edge * d[j + 3];
+  }
+  revealC.getContext("2d").putImageData(revealImg, 0, 0);
+  rimC.getContext("2d").putImageData(rimImg, 0, 0);
+  scene.globalCompositeOperation = "destination-in";
+  scene.drawImage(revealC, 0, 0);
+  scene.globalCompositeOperation = "source-over";
+  ctx.drawImage(sceneC, 0, 0);
+  ctx.drawImage(rimC, 0, 0);
+}
+let sceneC;
+
+window.ready = (async () => {
+  await document.fonts.load("600 54px Plex");
+  await document.fonts.ready;
+  paintPaper();
+  paintWash();
+  paintSun();
+  paintMeadow();
+  buildBee();
+  sceneC = layer();
+})();
+
+window.renderFrame = (t) => {
+  ctx.globalCompositeOperation = "source-over";
+  ctx.globalAlpha = 1;
+  ctx.drawImage(paperC, 0, 0);
+
+  const R = bloomRadius(t);
+  if (t < 2.3) { paintBloom(R); ctx.drawImage(bloomC, 0, 0); } else if (t < 12.85) { ctx.globalAlpha = 1 - progress(t, 12.5, 12.85); ctx.drawImage(washC, 0, 0); ctx.globalAlpha = 1; }
+
+  // Comb appears outward from the drop.
+  const comb = progress(t, 1.3, 2.9);
+  if (comb > 0 && t < 12.85) {
+    combTmp.globalCompositeOperation = "source-over";
+    combTmp.clearRect(0, 0, W, H);
+    combTmp.drawImage(combC, 0, 0);
+    if (comb < 1) {
+      const radius = easeInOut(comb) * 1500, grad = combTmp.createRadialGradient(O.x, O.y, radius * 0.7, O.x, O.y, radius + 1);
+      grad.addColorStop(0, "#000");
+      grad.addColorStop(1, "rgba(0,0,0,0)");
+      combTmp.globalCompositeOperation = "destination-in";
+      combTmp.fillStyle = grad;
+      combTmp.fillRect(0, 0, W, H);
+    }
+    ctx.drawImage(combTmpC, 0, 0);
+  }
+
+  // Gold light from the sun bleeding into the pink.
+  const sun = easeOut(progress(t, 5.6, 6.4));
+  if (sun > 0 && t < 12.9) {
+    ctx.globalCompositeOperation = "soft-light";
+    ctx.globalAlpha = sun;
+    ctx.drawImage(glowC, 0, 0);
+    ctx.globalCompositeOperation = "screen";
+    ctx.globalAlpha = sun * 0.26;
+    ctx.drawImage(glowC, 0, 0);
+    ctx.globalCompositeOperation = "source-over";
+    ctx.globalAlpha = 1;
+  }
+
+  if (t >= 11.1) drawMeadow(t);
+
+  if (sun > 0) {
+    const rise = 1 - backOut(progress(t, 5.6, 6.15));
+    const size = 420 * (0.4 + 0.6 * backOut(progress(t, 5.6, 6.15)));
+    for (let i = 0; i < 3; i++) {
+      const u = ((t * 0.32 + i / 3) % 1);
+      wobblyRing(SUN.x, SUN.y, SUN.r + 18 + u * 150, i * 2 + 1, 3, (1 - u) * 0.75 * sun);
+    }
+    ctx.globalAlpha = Math.min(1, sun * 1.5);
+    ctx.drawImage(sunC, SUN.x - size / 2, SUN.y - size / 2 + rise * 80, size, size);
+    ctx.globalAlpha = 1;
+  }
+
+  drawConfetti(t);
+  drawDiagram(t);
+  drawLine(t);
+  drawRings(t);
+  drawClock(t);
+  drawSisters(t);
+  drawDancer(t);
+  drawAngleLabel(t);
+  drawDistanceLabel(t);
+  if (t >= 11.9) drawPetals(t);
+  drawCaption(t);
+
+  ctx.globalCompositeOperation = "multiply";
+  ctx.drawImage(grainC, 0, 0);
+  ctx.globalCompositeOperation = "source-over";
+};
+const combTmpC = layer(), combTmp = combTmpC.getContext("2d");
+</script>
