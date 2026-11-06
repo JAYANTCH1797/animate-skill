@@ -8,7 +8,7 @@ Give it reference images or videos and a rough idea. It studies the style, plans
 
 ## What it can do
 
-- **Animate an image:** cut a picture into layers and bring it to life.
+- **Animate an image:** cut a picture into layers and bring it to life. See the [train example](examples/moving-image/train-animated.mp4), made from [this still](examples/moving-image/source.webp).
 - **Repaint a scene:** redraw a reference as a moving scene.
 - **Make a new film:** take a topic or story and animate it in the look of your references.
 

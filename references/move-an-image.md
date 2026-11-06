@@ -1,8 +1,8 @@
 # Move an image
 
-Working example: `examples/moving-image/layers.py` and `animate.py` in this skill's folder, written for a picture of a
-train under a blossom tree (the picture itself isn't included). Copy them into `animations/<slug>/` and change the masks
-and coordinates. This job needs OpenCV: `pip install opencv-python-headless`.
+Working example in this skill's `examples/moving-image/`: `source.webp` is the still, `train-animated.mp4` is the result,
+and `layers.py` and `animate.py` made it. Watch the video to see the bar, then copy the scripts into `animations/<slug>/`
+and change the masks and coordinates. This job needs OpenCV: `pip install opencv-python-headless`.
 
 Moving the real artwork keeps its quality, which code can't repaint. The craft is in deciding what can move without
 exposing something that was never painted.
