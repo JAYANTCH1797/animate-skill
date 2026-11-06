@@ -4,11 +4,26 @@ A [Claude Code](https://claude.com/claude-code) skill that makes short animated 
 
 Give it reference images or videos and a rough idea. It studies the style, plans the shots, draws every frame, writes the music, checks its own work and hands you an MP4. No AI video model, no animator.
 
+<table>
+  <tr>
+    <th>Your still image</th>
+    <th>Animated by this skill</th>
+  </tr>
+  <tr>
+    <td><img src="docs/train-still.jpg" width="320" alt="A still illustration of an orange train under a cherry blossom tree"></td>
+    <td><img src="docs/train.gif" width="320" alt="The same image animated: the train approaches, petals fall, branches and grass sway"></td>
+  </tr>
+</table>
+
+[Watch the full-quality video](examples/moving-image/train-animated.mp4)
+
+More frames from films made with this skill:
+
 ![Frames from films made with this skill](docs/preview.jpg)
 
 ## What it can do
 
-- **Animate an image:** cut a picture into layers and bring it to life. See the [train example](examples/moving-image/train-animated.mp4), made from [this still](examples/moving-image/source.webp).
+- **Animate an image:** cut a picture into layers and bring it to life, like the train above.
 - **Repaint a scene:** redraw a reference as a moving scene.
 - **Make a new film:** take a topic or story and animate it in the look of your references.
 
